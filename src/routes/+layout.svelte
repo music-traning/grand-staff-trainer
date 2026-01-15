@@ -1,15 +1,7 @@
 <script>
-	import favicon from '$lib/assets/favicon.svg';
-
-	let { children } = $props();
+  import { Analytics } from '@vercel/analytics/svelte';
 </script>
 
-<svelte:head>
-	<link rel="icon" href={favicon} />
-</svelte:head>
+<slot />
 
-{@render children()}
-
-// src/routes/+layout.js
-export const ssr = false;
-export const prerender = true;
+<Analytics />
