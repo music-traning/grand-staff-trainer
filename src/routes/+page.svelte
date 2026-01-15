@@ -12,7 +12,7 @@
   // 設定
   let selectedKey = $state("C");
   let selectedRange = $state("full");
-  let notationMode = $state("note"); // 'note' (C, D, E) | 'degree' (R, 2, 3) 【追加】
+  let notationMode = $state("note"); // 'note' | 'degree'
 
   // ゲーム状態
   let score = $state(0);
@@ -29,7 +29,7 @@
   let volume = $state(0);
   let message = $state("");
 
-  // 判定用
+  // 判定ロジック変数
   let wrongNoteCounter = 0; 
   let penaltyCooldown = false;
   let lastWrongNote = null;
@@ -44,7 +44,14 @@
   let particleIdCounter = 0;
 
   // 内部変数
-  let audioContext, analyser, microphone, dataArray, bufferLength, animationId, timerId;
+  let audioContext = null;
+  let analyser = null;
+  let microphone = null;
+  let mediaStream = null; // 【重要】マイクストリーム管理用
+  let dataArray;
+  let bufferLength;
+  let animationId;
+  let timerId;
   let chartInstance = null;
   let missChartInstance = null;
   let staffContainer;
@@ -61,7 +68,8 @@
     missStats: {}
   });
 
-  // --- 言語データ (丁寧版) ---
+  // --- 言語データ ---
+  // --- 言語データ (PWA案内追加版) ---
   const t = {
     jp: {
       title: "Grand Staff Trainer",
@@ -72,8 +80,8 @@
       bass: "Bass",
       keySelect: "Key Signature (調号)",
       rangeSelect: "Range (音域)",
-      notationSelect: "Notation (表記)", // 【追加】
-      notations: { note: "Note (音名)", degree: "Degree (度数)" }, // 【追加】
+      notationSelect: "Notation (表記)",
+      notations: { note: "Note (音名)", degree: "Degree (度数)" },
       ranges: { low: "Low (低)", mid: "Mid (中)", high: "High (高)", full: "Full Board" },
       score: "Score",
       combo: "Combo",
@@ -93,7 +101,8 @@
         "2. 【演奏】画面の五線譜に表示された音符を、お手持ちのギターやベースで弾いてください。",
         "3. 【判定】正解するとスコア獲得！連続正解（コンボ）で得点が跳ね上がります。",
         "4. 【注意】間違った音を弾き続けると減点となり、コンボが途切れます。",
-        "5. 【Tips】スマホでご利用の方は、画面の自動ロック（スリープ）をオフにすると快適です。"
+        "5. 【Tips】スマホでご利用の方は、画面の自動ロック（スリープ）をオフにすると快適です。",
+        "6. 【アプリ化】ブラウザのメニューから「ホーム画面に追加」を選ぶと、全画面の専用アプリとしてインストールできます。" // ★追加
       ],
       close: "閉じる",
       msgPerfect: "Perfect!!",
@@ -131,7 +140,8 @@
         "2. [Play] Play the note shown on the staff using your instrument.",
         "3. [Score] Correct notes build combos and boost your score multiplier.",
         "4. [Penalty] Sustained wrong notes will reset your combo and deduct points.",
-        "5. [Tips] For mobile users: It is recommended to disable screen auto-lock."
+        "5. [Tips] For mobile users: It is recommended to disable screen auto-lock.",
+        "6. [App] Select 'Add to Home Screen' from your browser menu to install this as a full-screen app." // ★追加
       ],
       close: "Close",
       msgPerfect: "Perfect!!",
@@ -146,24 +156,13 @@
   const RANGES = ["low", "mid", "high", "full"];
   const noteStrings = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
 
-  // --- 度数計算ロジック ---
   function getDegreeText(noteName, keyName) {
-    // Note: "C3" -> "C", Key: "G" -> "G"
     const note = noteName.replace(/\d+/, ""); 
     const noteIdx = noteStrings.indexOf(note);
     const keyIdx = noteStrings.indexOf(keyName);
-    
     if (noteIdx === -1 || keyIdx === -1) return noteName;
-
-    // 半音単位の距離 (0-11)
     let diff = (noteIdx - keyIdx + 12) % 12;
-
-    const degrees = {
-      0: "Root",
-      1: "b9", 2: "2nd", 3: "b3", 4: "3rd",
-      5: "4th", 6: "#4/b5", 7: "5th",
-      8: "b6", 9: "6th", 10: "b7", 11: "7th"
-    };
+    const degrees = { 0: "Root", 1: "b9", 2: "2nd", 3: "b3", 4: "3rd", 5: "4th", 6: "#4/b5", 7: "5th", 8: "b6", 9: "6th", 10: "b7", 11: "7th" };
     return degrees[diff] || "?";
   }
 
@@ -208,6 +207,20 @@
     }, 1000);
   });
 
+  // --- 画面表示監視 & クリーンアップ (New) ---
+  $effect(() => {
+    const handleVisibilityChange = () => {
+      if (document.hidden) {
+        stopAudio(); // 画面が隠れたらマイク切断
+      }
+    };
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    return () => {
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+      stopAudio(); // コンポーネント破棄時も切断
+    };
+  });
+
   function loadData() {
     const saved = localStorage.getItem("buroMusicTrainer");
     if (saved) {
@@ -225,7 +238,7 @@
     }
   }
 
-  // --- VexFlow 描画 ---
+  // --- VexFlow ---
   $effect(() => {
     if (currentScreen === 'game' && staffContainer && targetNote) {
       setTimeout(() => { try { drawScore(); } catch (e) { debugMsg = "Error: " + e.message; } }, 50); 
@@ -255,13 +268,14 @@
     Formatter.FormatAndDraw(context, stave, [note]);
   }
 
-  // --- Logic ---
+  // --- Audio Logic ---
   async function initAudio() {
     if (!audioContext) {
       try {
         audioContext = new (window.AudioContext || window.webkitAudioContext)();
-        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-        microphone = audioContext.createMediaStreamSource(stream);
+        mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        
+        microphone = audioContext.createMediaStreamSource(mediaStream);
         analyser = audioContext.createAnalyser();
         analyser.fftSize = 2048;
         bufferLength = analyser.fftSize;
@@ -270,8 +284,25 @@
         audioContext.resume();
         detectPitch();
       } catch (e) { alert("Mic required / マイクを許可してください"); return false; }
+    } else if (audioContext.state === 'suspended') {
+      await audioContext.resume();
     }
     return true;
+  }
+
+  function stopAudio() {
+    if (mediaStream) {
+      mediaStream.getTracks().forEach(track => track.stop());
+      mediaStream = null;
+    }
+    if (audioContext) {
+      audioContext.close();
+      audioContext = null;
+    }
+    if (animationId) {
+      cancelAnimationFrame(animationId);
+    }
+    isListening = false;
   }
 
   async function startGame() {
@@ -284,7 +315,6 @@
       userData.playCount++;
       message = text.msgReady;
       
-      // リセット
       wrongNoteCounter = 0;
       lastWrongNote = null;
       penaltyCooldown = false;
@@ -307,7 +337,7 @@
       if (maxComboSession > userData.maxCombo) userData.maxCombo = maxComboSession;
       saveData();
     }
-    isListening = false;
+    stopAudio(); // タイトルに戻るときもマイクを切る
     currentScreen = "title";
     clearInterval(timerId);
   }
@@ -344,7 +374,7 @@
     }, 50);
   }
 
-  // --- スコア＆コンボロジック ---
+  // --- Score Logic ---
   function checkAnswer() {
     if (processingAnswer) return;
     processingAnswer = true; 
@@ -439,7 +469,7 @@
     animationId = requestAnimationFrame(detectPitch);
   }
 
-  // FX
+  // FX & Utils
   function spawnParticles(type) {
     const count = type === "correct" ? 12 : 5;
     for (let i = 0; i < count; i++) {
@@ -481,11 +511,9 @@
     return sampleRate/T0;
   }
 
-  // Charts
   async function renderChart() {
     await tick();
     if (!chartRef || !missChartRef) return;
-    
     if (chartInstance) chartInstance.destroy();
     if (missChartInstance) missChartInstance.destroy();
 
@@ -497,25 +525,15 @@
       options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } }, scales: { y: { beginAtZero: true, grid: { color: '#333' } }, x: { display: false } } }
     });
 
-    const missEntries = Object.entries(userData.missStats || {})
-      .sort((a, b) => b[1] - a[1])
-      .slice(0, 5);
-
+    const missEntries = Object.entries(userData.missStats || {}).sort((a, b) => b[1] - a[1]).slice(0, 5);
     missChartInstance = new Chart(missChartRef, {
       type: 'bar',
       data: {
         labels: missEntries.map(e => e[0]),
-        datasets: [{
-          label: 'Miss Count',
-          data: missEntries.map(e => e[1]),
-          backgroundColor: '#ff4444',
-          borderColor: '#880000',
-          borderWidth: 1
-        }]
+        datasets: [{ label: 'Miss Count', data: missEntries.map(e => e[1]), backgroundColor: '#ff4444', borderColor: '#880000', borderWidth: 1 }]
       },
       options: {
-        responsive: true,
-        maintainAspectRatio: false,
+        responsive: true, maintainAspectRatio: false,
         plugins: { legend: { display: false }, title: { display: true, text: text.weakness, color: '#aaa' } },
         scales: { y: { beginAtZero: true, grid: { color: '#333' } }, x: { ticks: { color: '#ccc' } } }
       }
@@ -598,11 +616,8 @@
             {#each particles as p (p.id)} <div class="particle" style="--tx: {p.tx}px; --ty: {p.ty}px; --col: {p.color};"></div> {/each}
           </div>
           <div class="target-info">
-            {#if notationMode === 'degree'}
-              {getDegreeText(targetNote, selectedKey)} ({selectedKey} Key)
-            {:else}
-              {targetNote} ({selectedKey})
-            {/if}
+            {#if notationMode === 'degree'} {getDegreeText(targetNote, selectedKey)} ({selectedKey} Key)
+            {:else} {targetNote} ({selectedKey}) {/if}
           </div>
         </div>
       </div>
@@ -638,12 +653,10 @@
         <div class="stat-box"><span>{text.maxCombo}</span><strong>{userData.maxCombo}</strong></div>
         <div class="stat-box"><span>{text.totalTime}</span><strong>{Math.floor(userData.totalPlayTimeSec / 60)}m</strong></div>
       </div>
-      
       <div class="chart-flex">
         <div class="chart-wrapper"><canvas bind:this={chartRef}></canvas></div>
         <div class="chart-wrapper"><canvas bind:this={missChartRef}></canvas></div>
       </div>
-
       <div class="stats-footer">
         <button class="glass-btn danger" onclick={resetData}>{text.reset}</button>
         <button class="glass-btn" onclick={backToTitle}>{text.back}</button>
